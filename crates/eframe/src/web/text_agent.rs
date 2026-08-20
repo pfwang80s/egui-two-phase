@@ -52,10 +52,15 @@ impl TextAgent {
             root.append_child(&input)?;
         }
 
+        let text_agent = Self {
+            input,
+            prev_ime_output: Default::default(),
+        };
+
         // attach event listeners
 
         let on_input = {
-            let input = input.clone();
+            let input = text_agent.input.clone();
             move |event: web_sys::InputEvent, runner: &mut AppRunner| {
                 let text = input.value();
                 // Workaround for an Android Gboard issue: after typing a word,
@@ -130,7 +135,7 @@ impl TextAgent {
         };
 
         let on_composition_end = {
-            let input = input.clone();
+            let input = text_agent.input.clone();
             move |event: web_sys::CompositionEvent, runner: &mut AppRunner| {
                 let Some(text) = event.data() else { return };
                 input.set_value("");
@@ -140,19 +145,20 @@ impl TextAgent {
             }
         };
 
-        runner_ref.add_event_listener(&input, "input", on_input)?;
-        runner_ref.add_event_listener(&input, "compositionstart", on_composition_start)?;
-        runner_ref.add_event_listener(&input, "compositionend", on_composition_end)?;
+        runner_ref.add_event_listener(&text_agent.input, "input", on_input)?;
+        runner_ref.add_event_listener(
+            &text_agent.input,
+            "compositionstart",
+            on_composition_start,
+        )?;
+        runner_ref.add_event_listener(&text_agent.input, "compositionend", on_composition_end)?;
 
         // The canvas doesn't get keydown/keyup events when the text agent is focused,
         // so we need to forward them to the runner:
-        runner_ref.add_event_listener(&input, "keydown", super::events::on_keydown)?;
-        runner_ref.add_event_listener(&input, "keyup", super::events::on_keyup)?;
+        runner_ref.add_event_listener(&text_agent.input, "keydown", super::events::on_keydown)?;
+        runner_ref.add_event_listener(&text_agent.input, "keyup", super::events::on_keyup)?;
 
-        Ok(Self {
-            input,
-            prev_ime_output: Default::default(),
-        })
+        Ok(text_agent)
     }
 
     pub fn move_to(
