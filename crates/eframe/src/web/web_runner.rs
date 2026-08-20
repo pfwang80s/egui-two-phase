@@ -100,7 +100,9 @@ impl WebRunner {
         Ok(PreparedWebRunner {
             runner: self.clone(),
             canvas,
-            app_runner: Some(app_runner),
+            app_runner: Some(Box::new(app_runner)),
+            #[cfg(test)]
+            text_agent_attach: TextAgent::attach,
         })
     }
 
@@ -316,10 +318,43 @@ impl WebRunner {
 /// repaint callback, or animation-frame wake-up. [`PreparedWebRunner::activate`]
 /// installs all of those owners exactly once, while [`PreparedWebRunner::abort`]
 /// discards the prepared app without leaving them behind.
+///
+/// A prepared runner must be either [`activate`](Self::activate)d or
+/// [`abort`](Self::abort)ed before it is dropped. Dropping it directly does not
+/// run the painter cleanup path and can leak renderer resources.
+#[must_use = "call `activate` or `abort` before dropping a prepared web runner"]
 pub struct PreparedWebRunner {
     runner: WebRunner,
     canvas: web_sys::HtmlCanvasElement,
-    app_runner: Option<AppRunner>,
+    app_runner: Option<Box<dyn PreparedAppRunner>>,
+
+    #[cfg(test)]
+    text_agent_attach: fn(&WebRunner, web_sys::Node) -> Result<TextAgent, JsValue>,
+}
+
+trait PreparedAppRunner {
+    fn install_repaint_callback(&self);
+    fn attach_text_agent(&mut self, text_agent: TextAgent);
+    fn into_app_runner(self: Box<Self>) -> AppRunner;
+    fn destroy(self: Box<Self>);
+}
+
+impl PreparedAppRunner for AppRunner {
+    fn install_repaint_callback(&self) {
+        AppRunner::install_repaint_callback(self);
+    }
+
+    fn attach_text_agent(&mut self, text_agent: TextAgent) {
+        AppRunner::attach_text_agent(self, text_agent);
+    }
+
+    fn into_app_runner(self: Box<Self>) -> AppRunner {
+        *self
+    }
+
+    fn destroy(self: Box<Self>) {
+        AppRunner::destroy(*self);
+    }
 }
 
 impl PreparedWebRunner {
@@ -339,15 +374,16 @@ impl PreparedWebRunner {
 
         app_runner.install_repaint_callback();
 
-        let text_agent = match TextAgent::attach(&self.runner, self.canvas.get_root_node()) {
+        let text_agent = match self.attach_text_agent(self.canvas.get_root_node()) {
             Ok(text_agent) => text_agent,
             Err(err) => {
-                drop(app_runner);
+                app_runner.destroy();
                 self.runner.destroy();
                 return Err(err);
             }
         };
         app_runner.attach_text_agent(text_agent);
+        let app_runner = app_runner.into_app_runner();
         self.runner.app_runner.replace(Some(app_runner));
 
         if let Err(err) = self.install_runtime_owners() {
@@ -361,9 +397,20 @@ impl PreparedWebRunner {
 
     /// Discard a prepared web app without installing or leaving runtime owners.
     pub fn abort(mut self) {
-        let app_runner = self.app_runner.take();
+        if let Some(app_runner) = self.app_runner.take() {
+            app_runner.destroy();
+        }
         self.runner.destroy();
-        drop(app_runner);
+    }
+
+    #[cfg(not(test))]
+    fn attach_text_agent(&self, root: web_sys::Node) -> Result<TextAgent, JsValue> {
+        TextAgent::attach(&self.runner, root)
+    }
+
+    #[cfg(test)]
+    fn attach_text_agent(&self, root: web_sys::Node) -> Result<TextAgent, JsValue> {
+        (self.text_agent_attach)(&self.runner, root)
     }
 
     fn install_runtime_owners(&self) -> Result<(), JsValue> {
@@ -453,5 +500,86 @@ impl EventToUnsubscribe {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use super::*;
+
+    struct MockAppRunner {
+        destroyed: Rc<Cell<bool>>,
+    }
+
+    impl PreparedAppRunner for MockAppRunner {
+        fn install_repaint_callback(&self) {}
+
+        fn attach_text_agent(&mut self, _text_agent: TextAgent) {}
+
+        fn into_app_runner(self: Box<Self>) -> AppRunner {
+            panic!("test app runner cannot be activated successfully")
+        }
+
+        fn destroy(self: Box<Self>) {
+            self.destroyed.set(true);
+        }
+    }
+
+    fn test_canvas() -> web_sys::HtmlCanvasElement {
+        web_sys::window()
+            .expect("window should exist in a browser test")
+            .document()
+            .expect("document should exist in a browser test")
+            .create_element("canvas")
+            .expect("creating a canvas should succeed")
+            .dyn_into()
+            .expect("element should be a canvas")
+    }
+
+    fn prepared_with_mock(
+        destroyed: Rc<Cell<bool>>,
+        text_agent_attach: fn(&WebRunner, web_sys::Node) -> Result<TextAgent, JsValue>,
+    ) -> (WebRunner, PreparedWebRunner) {
+        let runner = WebRunner::new();
+        let prepared = PreparedWebRunner {
+            runner: runner.clone(),
+            canvas: test_canvas(),
+            app_runner: Some(Box::new(MockAppRunner { destroyed })),
+            text_agent_attach,
+        };
+        (runner, prepared)
+    }
+
+    fn assert_no_runtime_owners(runner: &WebRunner) {
+        assert!(runner.events_to_unsubscribe.borrow().is_empty());
+        assert!(runner.frame.borrow().is_none());
+        assert!(runner.resize_observer.borrow().is_none());
+    }
+
+    #[test]
+    fn abort_destroys_prepared_app_runner() {
+        let destroyed = Rc::new(Cell::new(false));
+        let (runner, prepared) = prepared_with_mock(destroyed.clone(), TextAgent::attach);
+
+        prepared.abort();
+
+        assert!(destroyed.get());
+        assert_no_runtime_owners(&runner);
+    }
+
+    #[test]
+    fn text_agent_attach_failure_destroys_prepared_app_runner() {
+        let destroyed = Rc::new(Cell::new(false));
+        let (runner, prepared) = prepared_with_mock(destroyed.clone(), |_, _| {
+            Err(JsValue::from_str("forced text agent attach failure"))
+        });
+
+        let result = prepared.activate();
+
+        assert!(result.is_err());
+        assert!(destroyed.get());
+        assert_no_runtime_owners(&runner);
     }
 }
