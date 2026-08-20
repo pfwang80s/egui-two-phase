@@ -60,6 +60,28 @@ impl WebRunner {
         web_options: crate::WebOptions,
         app_creator: epi::AppCreator<'static>,
     ) -> Result<(), JsValue> {
+        self.prepare_app(canvas, web_options, app_creator)
+            .await?
+            .activate()
+    }
+
+    /// Prepare a web app without installing any DOM or paint-loop owners.
+    ///
+    /// The returned [`PreparedWebRunner`] owns the initialized [`AppRunner`],
+    /// the canvas, and a clone of this [`WebRunner`]. Call
+    /// [`PreparedWebRunner::activate`] to install the event handlers, resize
+    /// observer, text agent, repaint callback, and animation frame, or call
+    /// [`PreparedWebRunner::abort`] to discard it without leaving listeners
+    /// behind.
+    ///
+    /// # Errors
+    /// Failing to initialize graphics, or failure to create app.
+    pub async fn prepare_app(
+        &self,
+        canvas: web_sys::HtmlCanvasElement,
+        web_options: crate::WebOptions,
+        app_creator: epi::AppCreator<'static>,
+    ) -> Result<PreparedWebRunner, JsValue> {
         self.destroy();
 
         {
@@ -71,28 +93,15 @@ impl WebRunner {
             canvas.style().set_property("outline", "none")?;
         }
 
-        {
-            // First set up the app runner:
-            let text_agent = TextAgent::attach(self, canvas.get_root_node())?;
-            let app_runner =
-                AppRunner::new(canvas.clone(), web_options, app_creator, text_agent).await?;
-            self.app_runner.replace(Some(app_runner));
-        }
+        let app_runner = AppRunner::new(canvas.clone(), web_options, app_creator)
+            .await
+            .map_err(|err| JsValue::from_str(&err))?;
 
-        {
-            let resize_observer = events::ResizeObserverContext::new(self)?;
-
-            // Properly size the canvas. Will also call `self.request_animation_frame()` (eventually)
-            resize_observer.observe(&canvas);
-
-            self.resize_observer.replace(Some(resize_observer));
-        }
-
-        events::install_event_handlers(self)?;
-
-        log::info!("event handlers installed.");
-
-        Ok(())
+        Ok(PreparedWebRunner {
+            runner: self.clone(),
+            canvas,
+            app_runner: Some(app_runner),
+        })
     }
 
     /// Has there been a panic?
@@ -297,6 +306,77 @@ impl WebRunner {
             frame.cancel(&web_sys::window().unwrap());
         }
         self.request_animation_frame()
+    }
+}
+
+/// A prepared, but not yet activated, web app.
+///
+/// Creating this value initializes the painter, egui context, and application,
+/// but does not install the DOM event handlers, resize observer, text agent,
+/// repaint callback, or animation-frame wake-up. [`PreparedWebRunner::activate`]
+/// installs all of those owners exactly once, while [`PreparedWebRunner::abort`]
+/// discards the prepared app without leaving them behind.
+pub struct PreparedWebRunner {
+    runner: WebRunner,
+    canvas: web_sys::HtmlCanvasElement,
+    app_runner: Option<AppRunner>,
+}
+
+impl PreparedWebRunner {
+    /// Install all runtime owners and start the browser paint loop.
+    ///
+    /// This consumes the prepared value, so it cannot be activated more than
+    /// once.
+    ///
+    /// # Errors
+    /// Failing to install any required DOM or browser owner. On error, all
+    /// previously installed owners are destroyed.
+    pub fn activate(mut self) -> Result<(), JsValue> {
+        let mut app_runner = self
+            .app_runner
+            .take()
+            .expect("prepared app runner is missing");
+
+        app_runner.install_repaint_callback();
+
+        let text_agent = match TextAgent::attach(&self.runner, self.canvas.get_root_node()) {
+            Ok(text_agent) => text_agent,
+            Err(err) => {
+                drop(app_runner);
+                self.runner.destroy();
+                return Err(err);
+            }
+        };
+        app_runner.attach_text_agent(text_agent);
+        self.runner.app_runner.replace(Some(app_runner));
+
+        if let Err(err) = self.install_runtime_owners() {
+            self.runner.destroy();
+            return Err(err);
+        }
+
+        log::info!("event handlers installed.");
+        Ok(())
+    }
+
+    /// Discard a prepared web app without installing or leaving runtime owners.
+    pub fn abort(mut self) {
+        let app_runner = self.app_runner.take();
+        self.runner.destroy();
+        drop(app_runner);
+    }
+
+    fn install_runtime_owners(&self) -> Result<(), JsValue> {
+        let resize_observer = events::ResizeObserverContext::new(&self.runner)?;
+
+        // Properly size the canvas. This also triggers the first repaint, but we
+        // request an animation frame explicitly below so activation has a
+        // guaranteed wake-up even if the observer callback is delayed.
+        resize_observer.observe(&self.canvas);
+        self.runner.resize_observer.replace(Some(resize_observer));
+
+        events::install_event_handlers(&self.runner)?;
+        self.runner.request_animation_frame()
     }
 }
 

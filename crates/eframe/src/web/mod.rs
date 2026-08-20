@@ -22,7 +22,7 @@ pub mod storage;
 pub(crate) use app_runner::AppRunner;
 pub use panic_handler::{PanicHandler, PanicSummary};
 pub use web_logger::WebLogger;
-pub use web_runner::WebRunner;
+pub use web_runner::{PreparedWebRunner, WebRunner};
 
 #[cfg(not(any(feature = "glow", feature = "wgpu_no_default_features")))]
 compile_error!("You must enable either the 'glow' or 'wgpu' feature");

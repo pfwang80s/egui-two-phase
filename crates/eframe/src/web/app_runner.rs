@@ -16,7 +16,7 @@ pub struct AppRunner {
     app: Box<dyn epi::App>,
     pub(crate) needs_repaint: Arc<NeedRepaint>,
     last_save_time: f64,
-    pub(crate) text_agent: TextAgent,
+    pub(crate) text_agent: Option<TextAgent>,
 
     // If not empty, the painter should capture n frames from now.
     // zero means capture the exact next frame.
@@ -44,7 +44,6 @@ impl AppRunner {
         canvas: web_sys::HtmlCanvasElement,
         web_options: crate::WebOptions,
         app_creator: epi::AppCreator<'static>,
-        text_agent: TextAgent,
     ) -> Result<Self, String> {
         let egui_ctx = egui::Context::default();
 
@@ -141,12 +140,6 @@ impl AppRunner {
         };
 
         let needs_repaint: Arc<NeedRepaint> = Arc::new(NeedRepaint::new(web_options.max_fps));
-        {
-            let needs_repaint = Arc::clone(&needs_repaint);
-            egui_ctx.set_request_repaint_callback(move |info| {
-                needs_repaint.repaint_after(info.delay.as_secs_f64());
-            });
-        }
 
         let mut runner = Self {
             web_options,
@@ -157,7 +150,7 @@ impl AppRunner {
             app,
             needs_repaint,
             last_save_time: now_sec(),
-            text_agent,
+            text_agent: None,
             screenshot_commands_with_frame_delay: vec![],
             textures_delta: Default::default(),
             clipped_primitives: None,
@@ -174,6 +167,27 @@ impl AppRunner {
         runner.input.raw.system_theme = super::system_theme();
 
         Ok(runner)
+    }
+
+    /// Install the egui repaint callback.
+    ///
+    /// This is deliberately separate from [`Self::new`] so the runner can be
+    /// prepared without waking up the browser paint loop or being reachable
+    /// from any DOM event handler.
+    pub(crate) fn install_repaint_callback(&self) {
+        let needs_repaint = Arc::clone(&self.needs_repaint);
+        self.egui_ctx.set_request_repaint_callback(move |info| {
+            needs_repaint.repaint_after(info.delay.as_secs_f64());
+        });
+    }
+
+    /// Store the prepared text agent.
+    ///
+    /// The text agent is created and its DOM listeners are installed during
+    /// activation, after the [`AppRunner`] itself has been prepared.
+    pub(crate) fn attach_text_agent(&mut self, text_agent: TextAgent) {
+        debug_assert!(self.text_agent.is_none());
+        self.text_agent = Some(text_agent);
     }
 
     pub fn egui_ctx(&self) -> &egui::Context {
@@ -231,7 +245,8 @@ impl AppRunner {
             return false;
         }
 
-        super::has_focus(self.canvas()) || self.text_agent.has_focus()
+        super::has_focus(self.canvas())
+            || self.text_agent.as_ref().is_some_and(TextAgent::has_focus)
     }
 
     pub fn update_focus(&mut self) {
@@ -393,26 +408,25 @@ impl AppRunner {
 
         super::set_cursor_icon(self.canvas(), cursor_icon);
 
-        if self.has_focus() {
-            // The eframe app has focus.
-            if ime.is_some() {
-                // We are editing text: give the focus to the text agent.
-                self.text_agent.focus();
-            } else {
-                // We are not editing text - give the focus to the canvas.
-                self.text_agent.blur();
-                self.canvas().focus().ok();
+        if let Some(text_agent) = &self.text_agent {
+            if self.has_focus() {
+                // The eframe app has focus.
+                if ime.is_some() {
+                    // We are editing text: give the focus to the text agent.
+                    text_agent.focus();
+                } else {
+                    // We are not editing text - give the focus to the canvas.
+                    text_agent.blur();
+                    self.canvas().focus().ok();
+                }
             }
-        }
 
-        if let Err(err) = self
-            .text_agent
-            .move_to(ime, self.canvas(), self.egui_ctx.zoom_factor())
-        {
-            log::error!(
-                "failed to update text agent position: {}",
-                super::string_from_js_value(&err)
-            );
+            if let Err(err) = text_agent.move_to(ime, self.canvas(), self.egui_ctx.zoom_factor()) {
+                log::error!(
+                    "failed to update text agent position: {}",
+                    super::string_from_js_value(&err)
+                );
+            }
         }
     }
 }

@@ -181,7 +181,7 @@ pub use web_sys;
 pub mod web;
 
 #[cfg(target_arch = "wasm32")]
-pub use web::{WebLogger, WebRunner};
+pub use web::{PreparedWebRunner, WebLogger, WebRunner};
 
 // ----------------------------------------------------------------------------
 // When compiling natively
